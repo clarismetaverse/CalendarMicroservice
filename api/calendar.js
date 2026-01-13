@@ -1,126 +1,122 @@
 export default async function handler(req, res) {
-  if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed' })
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  return res.status(200).json({
-    ok: true,
-    message: 'Calendar microservice is live'
-  })
-}
   const {
     offer_id: offerId,
     from,
     to,
     bookings = [],
-    offer_timeslots: offerTimeslots = [],
+    offer_timeslots = [],
     timeslots = [],
   } = req.body || {};
 
   if (!offerId || !from || !to) {
-    return res.status(400).json({ error: 'Missing required fields.' });
+    return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  // Build quick lookup for timeslots by id.
-  const timeslotById = new Map(timeslots.map((slot) => [slot.id, slot]));
+  // Timeslot lookup
+  const timeslotById = new Map(
+    timeslots.map(slot => [slot.id, slot])
+  );
 
-  // Determine active timeslots for the offer.
+  // Active timeslots for this offer
   const activeTimeslotIds = new Set(
-    offerTimeslots
-      .filter((entry) => entry.offer_upgrade_id === offerId && entry.active)
-      .map((entry) => entry.timeslot_id)
+    offer_timeslots
+      .filter(o => o.offer_upgrade_id === offerId && o.active)
+      .map(o => o.timeslot_id)
   );
 
   const slotLimit =
-    bookings.find((booking) => booking.offer_upgrade_id === offerId)?.SlotLimit ||
-    null;
+    bookings.find(b => b.offer_upgrade_id === offerId)?.SlotLimit || null;
 
-  // Filter bookings by offer, status, and date range.
-  const filteredBookings = bookings.filter((booking) => {
-    if (booking.offer_upgrade_id !== offerId) return false;
-    if (booking.status !== 'confirmed') return false;
-    if (booking.date < from || booking.date > to) return false;
-    return true;
-  });
+  if (!slotLimit || !slotLimit.Type || typeof slotLimit.Limit !== 'number') {
+    return res.status(200).json({ available_days: [] });
+  }
 
-  // Group bookings by date.
+  // Filter confirmed bookings in date range
+  const filteredBookings = bookings.filter(b =>
+    b.offer_upgrade_id === offerId &&
+    b.status === 'confirmed' &&
+    b.date >= from &&
+    b.date <= to
+  );
+
+  // Group bookings by date
   const bookingsByDate = new Map();
-  for (const booking of filteredBookings) {
-    if (!bookingsByDate.has(booking.date)) {
-      bookingsByDate.set(booking.date, []);
+  for (const b of filteredBookings) {
+    if (!bookingsByDate.has(b.date)) {
+      bookingsByDate.set(b.date, []);
     }
-    bookingsByDate.get(booking.date).push(booking);
+    bookingsByDate.get(b.date).push(b);
   }
 
   const availableDays = [];
 
-  const hasValidSlotLimit =
-    slotLimit && slotLimit.Type && typeof slotLimit.Limit === 'number';
-
-  if (!hasValidSlotLimit || activeTimeslotIds.size === 0) {
-    return res.status(200).json({ available_days: [] });
-  }
-
   const startDate = new Date(`${from}T00:00:00Z`);
   const endDate = new Date(`${to}T00:00:00Z`);
-  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-    return res.status(400).json({ error: 'Invalid date range.' });
-  }
 
   for (
-    let cursor = new Date(startDate);
-    cursor <= endDate;
-    cursor.setUTCDate(cursor.getUTCDate() + 1)
+    let d = new Date(startDate);
+    d <= endDate;
+    d.setUTCDate(d.getUTCDate() + 1)
   ) {
-    const date = cursor.toISOString().slice(0, 10);
-    const dateBookings = bookingsByDate.get(date) || [];
+    const date = d.toISOString().slice(0, 10);
+    const dayBookings = bookingsByDate.get(date) || [];
 
+    // DAY LIMIT
     if (slotLimit.Type === 'day') {
-      // Day limit applies to total confirmed bookings.
-      const remaining = slotLimit.Limit - dateBookings.length;
+      const remaining = slotLimit.Limit - dayBookings.length;
       if (remaining > 0) {
         availableDays.push({
           date,
           available: true,
-          remaining_slots: remaining,
+          remaining_slots: remaining
         });
       }
       continue;
     }
 
+    // HOUR / TIMESLOT LIMIT
     if (slotLimit.Type === 'hour') {
-      // Hour limit applies per timeslot.
-      const bookingsByTimeslot = new Map();
-      for (const booking of dateBookings) {
-        if (!activeTimeslotIds.has(booking.timeslot_id)) {
-          continue;
-        }
-        bookingsByTimeslot.set(
-          booking.timeslot_id,
-          (bookingsByTimeslot.get(booking.timeslot_id) || 0) + 1
+      const usage = new Map();
+
+      for (const b of dayBookings) {
+        if (!activeTimeslotIds.has(b.timeslot_id)) continue;
+        usage.set(
+          b.timeslot_id,
+          (usage.get(b.timeslot_id) || 0) + 1
         );
       }
 
+      let hasAvailability = false;
       let maxRemaining = 0;
-      for (const timeslotId of activeTimeslotIds) {
-        if (!timeslotById.has(timeslotId)) {
-          continue;
-        }
-        const used = bookingsByTimeslot.get(timeslotId) || 0;
+
+      for (const tsId of activeTimeslotIds) {
+        if (!timeslotById.has(tsId)) continue;
+        const used = usage.get(tsId) || 0;
         const remaining = slotLimit.Limit - used;
-        if (remaining > maxRemaining) {
-          maxRemaining = remaining;
+        if (remaining > 0) {
+          hasAvailability = true;
+          maxRemaining = Math.max(maxRemaining, remaining);
         }
       }
 
-      if (maxRemaining > 0) {
+      if (hasAvailability) {
         availableDays.push({
           date,
           available: true,
-          remaining_slots: maxRemaining,
+          remaining_slots: maxRemaining
         });
       }
     }
+  }
+
+  return res.status(200).json({
+    available_days: availableDays
+  });
+}
   }
 
   return res.status(200).json({ available_days: availableDays });
