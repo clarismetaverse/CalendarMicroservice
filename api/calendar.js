@@ -1,9 +1,13 @@
-export default function handler(req, res) {
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', ['POST']);
-    return res.status(405).json({ error: 'Method Not Allowed' });
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' })
   }
 
+  return res.status(200).json({
+    ok: true,
+    message: 'Calendar microservice is live'
+  })
+}
   const {
     offer_id: offerId,
     from,
