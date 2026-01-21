@@ -1,77 +1,143 @@
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+import type { VercelRequest, VercelResponse } from 'vercel'
+
+const XANO_RAW_URL =
+  'https://xbut-eryu-hhsg.f2.xano.io/api:vGd6XDW3/calendar/raw/Data'
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', ['GET'])
+    return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const { offer_id, from, to } = req.body || {};
+  const offerId = Number(req.query.offer_id)
+  const from = Number(req.query.from)
+  const to = Number(req.query.to)
 
-  if (!offer_id || !from || !to) {
-    return res.status(400).json({ error: 'Missing required fields' });
+  if (!offerId || !from || !to) {
+    return res.status(400).json({
+      error: 'Missing required params: offer_id, from, to'
+    })
   }
 
   // 1️⃣ Fetch raw data from Xano
-  const response = await fetch(
-    `${process.env.XANO_CALENDAR_RAW_URL}?offer_upgrade_id=${offer_id}&from=${from}&to=${to}`
-  );
+  const rawRes = await fetch(XANO_RAW_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      offer_id: offerId,
+      from,
+      to
+    })
+  })
 
-  if (!response.ok) {
-    return res.status(500).json({ error: 'Failed to fetch data from Xano' });
+  if (!rawRes.ok) {
+    return res.status(500).json({
+      error: 'Failed to fetch raw calendar data'
+    })
   }
 
-  const {
-    bookings = [],
-    offer_timeslots = [],
-    timeslots = [],
-    slot_limit
-  } = await response.json();
+  const raw = await rawRes.json()
 
-  // 2️⃣ Build helpers
+  const bookings = raw.book ?? []
+  const offerTimeslots = raw.offer_timeslot ?? []
+
+  // 2️⃣ Active timeslots for this offer
   const activeTimeslotIds = new Set(
-    offer_timeslots
-      .filter(o => o.active)
-      .map(o => o.timeslot_id)
-  );
+    offerTimeslots
+      .filter((o: any) => o.active)
+      .map((o: any) => o.timeslot_id)
+  )
 
-  const bookingsByDate = {};
-  for (const b of bookings) {
-    if (!bookingsByDate[b.date]) bookingsByDate[b.date] = [];
-    bookingsByDate[b.date].push(b);
+  if (activeTimeslotIds.size === 0) {
+    return res.status(200).json({ available_days: [] })
   }
 
-  // 3️⃣ Calendar logic
-  const available_days = [];
-  const start = new Date(from);
-  const end = new Date(to);
+  // 3️⃣ Slot limit logic (day or hour)
+  const slotLimit =
+    bookings.find((b: any) => b.offer_upgrade_id === offerId)?.SlotLimit ?? null
 
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const date = d.toISOString().slice(0, 10);
-    const dayBookings = bookingsByDate[date] || [];
+  if (!slotLimit || !slotLimit.Type || !slotLimit.Limit) {
+    return res.status(200).json({ available_days: [] })
+  }
 
-    if (slot_limit.type === 'day') {
-      const remaining = slot_limit.limit - dayBookings.length;
+  // 4️⃣ Group confirmed bookings by date
+  const confirmed = bookings.filter(
+    (b: any) =>
+      b.offer_upgrade_id === offerId &&
+      b.status === 'CONFIRMED' &&
+      b.timestamp >= from &&
+      b.timestamp <= to
+  )
+
+  const bookingsByDay = new Map<string, any[]>()
+  for (const b of confirmed) {
+    if (!bookingsByDay.has(b.date)) {
+      bookingsByDay.set(b.date, [])
+    }
+    bookingsByDay.get(b.date)!.push(b)
+  }
+
+  // 5️⃣ Iterate calendar days
+  const availableDays: any[] = []
+
+  for (
+    let cursor = new Date(from);
+    cursor.getTime() <= to;
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  ) {
+    const dateISO = cursor.toISOString().slice(0, 10)
+    const dayBookings = bookingsByDay.get(dateISO) ?? []
+
+    // 🟢 DAY BASED LIMIT
+    if (slotLimit.Type === 'day') {
+      const remaining = slotLimit.Limit - dayBookings.length
       if (remaining > 0) {
-        available_days.push({ date, remaining_slots: remaining });
+        availableDays.push({
+          date: dateISO,
+          timestamp: cursor.getTime(),
+          remaining_slots: remaining
+        })
       }
+      continue
     }
 
-    if (slot_limit.type === 'hour') {
-      const usage = {};
+    // 🟣 TIMESLOT BASED LIMIT
+    if (slotLimit.Type === 'hour') {
+      const usedBySlot = new Map<number, number>()
+
       for (const b of dayBookings) {
-        if (!activeTimeslotIds.has(b.timeslot_id)) continue;
-        usage[b.timeslot_id] = (usage[b.timeslot_id] || 0) + 1;
+        if (!activeTimeslotIds.has(b.timeslot_id)) continue
+        usedBySlot.set(
+          b.timeslot_id,
+          (usedBySlot.get(b.timeslot_id) ?? 0) + 1
+        )
       }
 
-      let maxRemaining = 0;
-      for (const tsId of activeTimeslotIds) {
-        const used = usage[tsId] || 0;
-        maxRemaining = Math.max(maxRemaining, slot_limit.limit - used);
+      let hasFreeSlot = false
+
+      for (const slotId of activeTimeslotIds) {
+        const used = usedBySlot.get(slotId) ?? 0
+        if (slotLimit.Limit - used > 0) {
+          hasFreeSlot = true
+          break
+        }
       }
 
-      if (maxRemaining > 0) {
-        available_days.push({ date, remaining_slots: maxRemaining });
+      if (hasFreeSlot) {
+        availableDays.push({
+          date: dateISO,
+          timestamp: cursor.getTime(),
+          remaining_slots: 1
+        })
       }
     }
   }
 
-  return res.status(200).json({ available_days });
+  // 6️⃣ Response
+  return res.status(200).json({
+    ok: true,
+    offer_id: offerId,
+    range: { from, to },
+    available_days: availableDays
+  })
 }
