@@ -75,4 +75,10 @@ export default function handler(req, res) {
       }
     }
 
-    return res.status(200).json({ available_days:
+    return res.status(200).json({ available_days: availableDays });
+
+  } catch (err) {
+    console.error('Calendar microservice error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+}
